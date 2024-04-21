@@ -1,18 +1,12 @@
 package rw.nzeyi.example.android.pytorch.asr;
 
-import androidx.appcompat.app.AppCompatActivity;
-
-import android.os.Bundle;
-
 import android.Manifest;
 import android.content.Context;
 import android.content.pm.PackageManager;
 import android.media.AudioFormat;
 import android.media.AudioRecord;
 import android.media.MediaRecorder;
-import android.os.Build;
 import android.os.Bundle;
-import android.os.SystemClock;
 import android.util.Log;
 import android.view.View;
 import android.widget.Button;
@@ -22,6 +16,7 @@ import androidx.appcompat.app.AppCompatActivity;
 import androidx.core.app.ActivityCompat;
 
 import org.pytorch.IValue;
+import org.pytorch.LiteModuleLoader;
 import org.pytorch.Module;
 import org.pytorch.Tensor;
 
@@ -32,12 +27,9 @@ import java.io.InputStream;
 import java.io.OutputStream;
 import java.nio.FloatBuffer;
 
-import org.pytorch.LiteModuleLoader;
-
 public class MainActivity extends AppCompatActivity implements Runnable {
     private static final String TAG = MainActivity.class.getName();
 
-    private Module mModuleEncoder;
     private TextView mTextView;
     private Button mButton;
     private boolean mListening;
@@ -45,12 +37,10 @@ public class MainActivity extends AppCompatActivity implements Runnable {
 
     private final static int REQUEST_RECORD_AUDIO = 13;
     private final static int SAMPLE_RATE = 16000;
-    private final static int CHUNK_TO_READ = 5;
+    private final static int BEAM_WIDTH = 8;
+    private final static int INPUT_SIZE = 1360;
     private final static int CHUNK_SIZE = 640;
-    private final static int INPUT_SIZE = 3200;
-
-    private IValue hypo = null;
-    private IValue state = null;
+    private Module asrModule;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -60,8 +50,8 @@ public class MainActivity extends AppCompatActivity implements Runnable {
         mButton = findViewById(R.id.btnRecognize);
         mTextView = findViewById(R.id.tvResult);
 
-        if (mModuleEncoder == null) {
-            mModuleEncoder = LiteModuleLoader.load(assetFilePath(getApplicationContext(), "kinspeak_asr_emformer_rnnt_v1.0.ptl"));
+        if (asrModule == null) {
+            asrModule = LiteModuleLoader.load(assetFilePath(getApplicationContext(), "mamba_ssm_asr_model_base_2024-04-17_v1.1.ptl"));
         }
 
         mButton.setOnClickListener(new View.OnClickListener() {
@@ -115,90 +105,60 @@ public class MainActivity extends AppCompatActivity implements Runnable {
 
     public void run() {
         android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_AUDIO);
-
         final int bufferSize = AudioRecord.getMinBufferSize(SAMPLE_RATE, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT);
         if (ActivityCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
-            // TODO: Consider calling
-            //    ActivityCompat#requestPermissions
-            // here to request the missing permissions, and then overriding
-            //   public void onRequestPermissionsResult(int requestCode, String[] permissions,
-            //                                          int[] grantResults)
-            // to handle the case where the user grants the permission. See the documentation
-            // for ActivityCompat#requestPermissions for more details.
             return;
         }
-        final AudioRecord record = new AudioRecord(MediaRecorder.AudioSource.DEFAULT, SAMPLE_RATE, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT,
-                bufferSize);
-
+        final AudioRecord record = new AudioRecord(MediaRecorder.AudioSource.DEFAULT, SAMPLE_RATE, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT, bufferSize);
         if (record.getState() != AudioRecord.STATE_INITIALIZED) {
             Log.e(TAG, "Audio Record can't initialize!");
             return;
         }
         record.startRecording();
-
-        int chunkToRead = CHUNK_TO_READ;
-        int recordingOffset = 0;
-        short[] recordingBuffer = new short[CHUNK_TO_READ * CHUNK_SIZE];
-        double[] floatInputBuffer = new double[CHUNK_TO_READ * CHUNK_SIZE];
-
+        boolean startedListening = false;
+        double[] floatInputBuffer = new double[INPUT_SIZE];
+        short[] newData = new short[INPUT_SIZE];
+        short[] oldData = new short[INPUT_SIZE];
+        short[] inputData = new short[INPUT_SIZE];
+        CTCBeamSearch.CTCBeamDecoder decoder = new CTCBeamSearch.CTCBeamDecoder(BEAM_WIDTH);
         while (mListening) {
-            long shortsRead = 0;
             short[] audioBuffer = new short[bufferSize / 2];
-
-            while (shortsRead < chunkToRead * CHUNK_SIZE) {
-                // for every segment of 5 chunks of data, we perform transcription
-                // each successive segment’s first chunk is exactly the preceding segment’s last chunk
+            int numDataToRead = startedListening ? CHUNK_SIZE : INPUT_SIZE;
+            int readOffset = 0;
+            while (readOffset < numDataToRead) {
                 int numberOfShort = record.read(audioBuffer, 0, audioBuffer.length);
-                shortsRead += numberOfShort;
-                int x = (int) (numberOfShort - (shortsRead - chunkToRead * CHUNK_SIZE));
-                if (shortsRead > chunkToRead * CHUNK_SIZE)
-                    System.arraycopy(audioBuffer, 0, recordingBuffer, recordingOffset, (int) (numberOfShort - (shortsRead - chunkToRead * 640)));
-                else
-                    System.arraycopy(audioBuffer, 0, recordingBuffer, recordingOffset, numberOfShort);
-
-                recordingOffset += numberOfShort;
+                if (numberOfShort < 1) {
+                    break;
+                }
+                System.arraycopy(audioBuffer, 0, newData, readOffset, Math.min(numDataToRead - readOffset, numberOfShort));
+                readOffset += Math.min(numDataToRead - readOffset, numberOfShort);
             }
-
-            for (int i = 0; i < CHUNK_TO_READ * CHUNK_SIZE; ++i) {
-                floatInputBuffer[i] = recordingBuffer[i] / (float) Short.MAX_VALUE;
+            // Now we have new data
+            if (startedListening) {
+                System.arraycopy(inputData, 0, oldData, 0, INPUT_SIZE);
+                System.arraycopy(oldData, CHUNK_SIZE, inputData, 0, INPUT_SIZE - CHUNK_SIZE);
+                System.arraycopy(newData, 0, inputData, INPUT_SIZE - CHUNK_SIZE, CHUNK_SIZE);
+            } else {
+                System.arraycopy(newData, 0, inputData, 0, INPUT_SIZE);
             }
-
-            final String result = recognize(floatInputBuffer);
-            if (result.length() > 0)
-                all_result = String.format("%s %s", all_result, result);
-
-            chunkToRead = CHUNK_TO_READ - 1;
-            recordingOffset = CHUNK_SIZE;
-            System.arraycopy(recordingBuffer, chunkToRead * CHUNK_SIZE, recordingBuffer, 0, CHUNK_SIZE);
-
+            for (int i = 0; i < INPUT_SIZE; ++i) {
+                floatInputBuffer[i] = inputData[i] / (float) Short.MAX_VALUE;
+            }
+            all_result = recognize(decoder, floatInputBuffer);
             runOnUiThread(() -> showTranslationResult(all_result));
+            startedListening = true;
         }
-
         record.stop();
         record.release();
     }
 
-    private String recognize(double[] inputBuffer) {
-        FloatBuffer inTensorBuffer = Tensor.allocateFloatBuffer(INPUT_SIZE);
+    private String recognize(CTCBeamSearch.CTCBeamDecoder decoder, double[] inputBuffer) {
+        FloatBuffer inTensorBuffer = Tensor.allocateFloatBuffer(inputBuffer.length);
         for (int i = 0; i < inputBuffer.length - 1; i++) {
             inTensorBuffer.put((float) inputBuffer[i]);
         }
-
-        final Tensor inTensor = Tensor.fromBlob(inTensorBuffer, new long[]{INPUT_SIZE});
-        final long startTime = SystemClock.elapsedRealtime();
-        IValue[] outputTuple;
-        if (hypo == null && state == null)
-            outputTuple = mModuleEncoder.forward(IValue.from(inTensor)).toTuple();
-        else
-            outputTuple = mModuleEncoder.forward(IValue.from(inTensor), hypo, state).toTuple();
-        final long inferenceTime = SystemClock.elapsedRealtime() - startTime;
-        Log.d(TAG, "inference time (ms): " + inferenceTime);
-        final String transcript = outputTuple[0].toStr().replace("▁", "");
-
-        hypo = outputTuple[1];
-        state = outputTuple[2];
-        if (transcript.length() > 0)
-            Log.d(TAG, "transcript=" + transcript);
-        return transcript;
+        final Tensor inTensor = Tensor.fromBlob(inTensorBuffer, new long[]{inputBuffer.length});
+        float[] log_probs = asrModule.forward(IValue.from(inTensor)).toTensor().getDataAsFloatArray();
+        return decoder.onNewInput(log_probs);
     }
 }
