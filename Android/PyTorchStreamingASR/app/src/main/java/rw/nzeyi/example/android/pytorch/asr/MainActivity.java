@@ -37,7 +37,7 @@ public class MainActivity extends AppCompatActivity implements Runnable {
 
     private final static int REQUEST_RECORD_AUDIO = 13;
     private final static int SAMPLE_RATE = 16000;
-    private final static int BEAM_WIDTH = 8;
+    private final static int BEAM_WIDTH = 16;
     private final static int INPUT_SIZE = 1360;
     private final static int CHUNK_SIZE = 640;
     private Module asrModule;
@@ -51,7 +51,7 @@ public class MainActivity extends AppCompatActivity implements Runnable {
         mTextView = findViewById(R.id.tvResult);
 
         if (asrModule == null) {
-            asrModule = LiteModuleLoader.load(assetFilePath(getApplicationContext(), "mamba_ssm_asr_model_base_2024-04-17_v1.1.ptl"));
+            asrModule = LiteModuleLoader.load(assetFilePath(getApplicationContext(), "mamba_ssm_asr_model_base_2024-04-17_v2.0.ptl"));
         }
 
         mButton.setOnClickListener(new View.OnClickListener() {
@@ -65,9 +65,10 @@ public class MainActivity extends AppCompatActivity implements Runnable {
                     all_result = "";
                     mTextView.setText("");
                 }
-
-                Thread thread = new Thread(MainActivity.this);
-                thread.start();
+                if (mListening) {
+                    Thread thread = new Thread(MainActivity.this);
+                    thread.start();
+                }
             }
         });
         requestMicrophonePermission();
@@ -121,6 +122,8 @@ public class MainActivity extends AppCompatActivity implements Runnable {
         short[] oldData = new short[INPUT_SIZE];
         short[] inputData = new short[INPUT_SIZE];
         CTCBeamSearch.CTCBeamDecoder decoder = new CTCBeamSearch.CTCBeamDecoder(BEAM_WIDTH);
+        //asrModule.runMethod("reset");
+        //resetModelState();
         while (mListening) {
             short[] audioBuffer = new short[bufferSize / 2];
             int numDataToRead = startedListening ? CHUNK_SIZE : INPUT_SIZE;
@@ -144,7 +147,10 @@ public class MainActivity extends AppCompatActivity implements Runnable {
             for (int i = 0; i < INPUT_SIZE; ++i) {
                 floatInputBuffer[i] = inputData[i] / (float) Short.MAX_VALUE;
             }
-            all_result = recognize(decoder, floatInputBuffer);
+            if (!startedListening) {
+                all_result = recognize(decoder, floatInputBuffer, INPUT_SIZE - (CHUNK_SIZE));
+            }
+            all_result = recognize(decoder, floatInputBuffer, floatInputBuffer.length);
             runOnUiThread(() -> showTranslationResult(all_result));
             startedListening = true;
         }
@@ -152,12 +158,22 @@ public class MainActivity extends AppCompatActivity implements Runnable {
         record.release();
     }
 
-    private String recognize(CTCBeamSearch.CTCBeamDecoder decoder, double[] inputBuffer) {
-        FloatBuffer inTensorBuffer = Tensor.allocateFloatBuffer(inputBuffer.length);
-        for (int i = 0; i < inputBuffer.length - 1; i++) {
+//    private void resetModelState() {
+//        double[] inputBuffer = {0.0, 0.0};
+//        FloatBuffer inTensorBuffer = Tensor.allocateFloatBuffer(inputBuffer.length);
+//        for (int i = 0; i < inputBuffer.length; i++) {
+//            inTensorBuffer.put((float) inputBuffer[i]);
+//        }
+//        final Tensor inTensor = Tensor.fromBlob(inTensorBuffer, new long[]{inputBuffer.length});
+//        asrModule.forward(IValue.from(inTensor)).toTensor().getDataAsFloatArray();
+//    }
+
+    private String recognize(CTCBeamSearch.CTCBeamDecoder decoder, double[] inputBuffer, int length) {
+        FloatBuffer inTensorBuffer = Tensor.allocateFloatBuffer(length);
+        for (int i = 0; i < length; i++) {
             inTensorBuffer.put((float) inputBuffer[i]);
         }
-        final Tensor inTensor = Tensor.fromBlob(inTensorBuffer, new long[]{inputBuffer.length});
+        final Tensor inTensor = Tensor.fromBlob(inTensorBuffer, new long[]{length});
         float[] log_probs = asrModule.forward(IValue.from(inTensor)).toTensor().getDataAsFloatArray();
         return decoder.onNewInput(log_probs);
     }
